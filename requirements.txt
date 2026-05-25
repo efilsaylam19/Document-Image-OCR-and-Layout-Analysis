@@ -3,3 +3,9 @@ pytesseract>=0.3.10
 Pillow>=10.0.0
 numpy>=1.24.0
 matplotlib>=3.7.0
+
+# PDF desteği (opsiyonel — Poppler da kurulu olmalı)
+pdf2image>=1.16.0
+
+# Aday Havuzu Excel çıktısı
+openpyxl>=3.1.0
