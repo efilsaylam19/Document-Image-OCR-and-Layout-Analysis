@@ -10,9 +10,55 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import sqlite3
 import os
+import sys
 import json
 import csv
+import subprocess
 from datetime import datetime
+
+
+def _open_file_dialog(title, filetypes, initialdir=None):
+    """
+    Show a file-open dialog that always starts in `initialdir`.
+    On Windows, uses PowerShell OpenFileDialog (ignores COM memory).
+    Falls back to tkinter filedialog on other platforms.
+    """
+    if initialdir is None:
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        initialdir = desktop if os.path.exists(desktop) else os.path.expanduser("~")
+
+    if sys.platform == "win32":
+        # Build PowerShell filter: "Images (*.png *.jpg)|*.png;*.jpg|All Files (*.*)|*.*"
+        ps_filters = []
+        for desc, patterns in filetypes:
+            # patterns like "*.png *.jpg *.jpeg" -> "*.png;*.jpg;*.jpeg"
+            ps_pat = patterns.replace(" ", ";")
+            ps_filters.append(f"{desc}|{ps_pat}")
+        filter_str = "|".join(ps_filters)
+        safe_dir = initialdir.replace("\\", "\\\\").replace("'", "''")
+        safe_title = title.replace("'", "''")
+        ps = f"""
+Add-Type -AssemblyName System.Windows.Forms
+$d = New-Object System.Windows.Forms.OpenFileDialog
+$d.Title = '{safe_title}'
+$d.Filter = '{filter_str}'
+$d.InitialDirectory = '{safe_dir}'
+$d.RestoreDirectory = $true
+if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}
+"""
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                capture_output=True, text=True, timeout=120
+            )
+            path = result.stdout.strip()
+            return path if path else ""
+        except Exception:
+            pass  # fall through to tkinter
+
+    # Fallback: tkinter dialog (Linux / macOS / PS failed)
+    ft = [(desc, pat) for desc, pat in filetypes]
+    return filedialog.askopenfilename(title=title, initialdir=initialdir, filetypes=ft) or ""
 
 try:
     from cv_parser import cv_parse
@@ -32,6 +78,12 @@ try:
     PDF_SUPPORTED = True
 except ImportError:
     PDF_SUPPORTED = False
+
+try:
+    from ats_checker import ats_score
+    ATS_VAR = True
+except ImportError:
+    ATS_VAR = False
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -360,6 +412,7 @@ class App:
         self.pdf_page_idx  = 0
         self.table_results = []
         self._selected_cid = None
+        self.last_parsed   = {}
 
         self.db = init_db()
         self._apply_style()
@@ -413,6 +466,7 @@ class App:
         self._tab_table(nb)
         self._tab_candidates(nb)
         self._tab_database(nb)
+        self._tab_ats(nb)
 
         # Status bar
         self.status_var = tk.StringVar(value="Ready")
@@ -811,12 +865,16 @@ class App:
     # ── IMAGE LOADING ─────────────────────────────
 
     def load_image_btn(self):
-        path = filedialog.askopenfilename(
-            title="Select Image",
-            filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp *.tiff"), ("All Files", "*.*")]
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        _start = getattr(self, "_last_open_dir", desktop if os.path.exists(desktop) else os.path.expanduser("~"))
+        path = _open_file_dialog(
+            "Select Image",
+            [("Image Files", "*.png *.jpg *.jpeg *.bmp *.tiff"), ("All Files", "*.*")],
+            initialdir=_start
         )
         if not path:
             return
+        self._last_open_dir = os.path.dirname(path)
         self.active_path   = path
         self.active_img    = load_image(path)
         self.processed_img = self.active_img.copy()
@@ -835,12 +893,16 @@ class App:
                 "Poppler is also required:\n"
                 "https://github.com/oschwartz10612/poppler-windows/releases")
             return
-        path = filedialog.askopenfilename(
-            title="Select PDF",
-            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        _start = getattr(self, "_last_open_dir", desktop if os.path.exists(desktop) else os.path.expanduser("~"))
+        path = _open_file_dialog(
+            "Select PDF",
+            [("PDF Files", "*.pdf"), ("All Files", "*.*")],
+            initialdir=_start
         )
         if not path:
             return
+        self._last_open_dir = os.path.dirname(path)
         self.status_var.set("Converting PDF...")
         self.root.update()
         try:
@@ -924,29 +986,57 @@ class App:
     def run_ocr_btn(self):
         if self.processed_img is None:
             messagebox.showwarning("Warning", "Load an image first!"); return
-        self.status_lbl.config(text="Processing...")
-        self.status_var.set("Running OCR...")
-        self.root.update()
 
-        text, words  = run_ocr(self.processed_img)
-        blocks       = find_text_blocks(self.processed_img)
-        self.last_text, self.last_words, self.last_blocks = text, words, blocks
+        # ── Multi-page PDF: OCR all pages and combine ──────────────────────
+        if self.pdf_pages and len(self.pdf_pages) > 1:
+            all_text   = []
+            all_words  = []
+            all_blocks = []
+            for idx, page_img in enumerate(self.pdf_pages):
+                self.status_lbl.config(text=f"Page {idx+1}/{len(self.pdf_pages)}…")
+                self.status_var.set(f"OCR page {idx+1} of {len(self.pdf_pages)}…")
+                self.root.update()
+                t, w = run_ocr(page_img)
+                b    = find_text_blocks(page_img)
+                all_text.append(t)
+                all_words.extend(w)
+                all_blocks.extend(b)
 
-        out = self.processed_img.copy()
-        for w in words:
+            text   = "\n\n--- Page Break ---\n\n".join(all_text)
+            words  = all_words
+            blocks = all_blocks
+
+            # Draw boxes on current page only (for preview)
+            out = self.processed_img.copy()
+            cur_words  = [w for w in run_ocr(self.processed_img)[1]]
+            cur_blocks = find_text_blocks(self.processed_img)
+        else:
+            # Single image or single-page PDF
+            self.status_lbl.config(text="Processing…")
+            self.status_var.set("Running OCR…")
+            self.root.update()
+            text, words  = run_ocr(self.processed_img)
+            blocks       = find_text_blocks(self.processed_img)
+            cur_words, cur_blocks = words, blocks
+            out = self.processed_img.copy()
+
+        # Draw bounding boxes on preview
+        for w in cur_words:
             cv2.rectangle(out, (w["x"], w["y"]),
                           (w["x"]+w["width"], w["y"]+w["height"]), (0, 180, 80), 1)
-        for (x, y, w2, h) in blocks:
+        for (x, y, w2, h) in cur_blocks:
             cv2.rectangle(out, (x, y), (x+w2, y+h), (74, 127, 204), 2)
         self._show_image(out)
 
+        self.last_text, self.last_words, self.last_blocks = text, words, blocks
         self.text_box.delete("1.0", "end")
         self.text_box.insert("1.0", text if text else "(No text found)")
         self.v_words.set(str(len(words)))
         self.v_blocks.set(str(len(blocks)))
         self.v_chars.set(str(len(text)))
         self.status_lbl.config(text="Done")
-        self.status_var.set(f"OCR complete  —  {os.path.basename(self.active_path)}")
+        pages_info = f"  ({len(self.pdf_pages)} pages)" if self.pdf_pages else ""
+        self.status_var.set(f"OCR complete{pages_info}  —  {os.path.basename(self.active_path)}")
 
     # ── COPY ──────────────────────────────────────
 
@@ -1038,6 +1128,7 @@ class App:
         if not CV_PARSER_VAR:
             messagebox.showerror("Error", "cv_parser.py not found!"); return
         candidate = cv_parse(self.last_text)
+        self.last_parsed = candidate          # store for ATS checker
         candidate["kaynak_dosya"] = os.path.basename(self.active_path)
         self._open_cv_editor(candidate)
 
@@ -1297,6 +1388,182 @@ class App:
             delete_document(self.db, doc_id)
             self.show_all_docs()
 
+
+    # ── TAB: ATS SCORE ────────────────────────────
+
+    def _tab_ats(self, nb):
+        tab = tk.Frame(nb, bg=BG)
+        nb.add(tab, text="  ATS Score  ")
+
+        # ── Top: score display + breakdown ──
+        top = tk.Frame(tab, bg=BG)
+        top.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Left: big score circle + rating
+        score_panel = tk.Frame(top, bg=CARD, highlightbackground=EDGE, highlightthickness=1)
+        score_panel.pack(side="left", fill="y", padx=(0, 8), ipadx=16, ipady=10)
+        score_panel.pack_propagate(False)
+        score_panel.configure(width=200)
+
+        tk.Label(score_panel, text="ATS Score", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 10)).pack(pady=(16, 4))
+
+        self.ats_canvas = tk.Canvas(score_panel, width=130, height=130,
+                                     bg=CARD, highlightthickness=0)
+        self.ats_canvas.pack(pady=(4, 0))
+
+        self.ats_rating_var = tk.StringVar(value="Run a check")
+        tk.Label(score_panel, textvariable=self.ats_rating_var,
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 11, "bold")).pack(pady=(8, 4))
+
+        self.ats_max_var = tk.StringVar(value="")
+        tk.Label(score_panel, textvariable=self.ats_max_var,
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack()
+
+        flat_btn(score_panel, "Run ATS Check", self.run_ats_check,
+                 color=BLUE).pack(pady=(16, 8), padx=12, fill="x")
+
+        self._draw_ats_circle(0, "#363d5a")
+
+        # Right: breakdown list
+        right_panel = tk.Frame(top, bg=CARD, highlightbackground=EDGE, highlightthickness=1)
+        right_panel.pack(side="left", fill="both", expand=True)
+
+        tk.Label(right_panel, text="Score Breakdown", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(10, 4))
+
+        self.breakdown_frame = tk.Frame(right_panel, bg=CARD)
+        self.breakdown_frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        tk.Label(self.breakdown_frame, text="Load an image, run OCR, then click 'Run ATS Check'.",
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=20)
+
+        # ── Bottom: Job Description input ──
+        jd_panel = tk.Frame(tab, bg=CARD, highlightbackground=EDGE, highlightthickness=1)
+        jd_panel.pack(fill="x", padx=10, pady=(0, 10))
+
+        jd_header = tk.Frame(jd_panel, bg=CARD)
+        jd_header.pack(fill="x", padx=12, pady=(10, 2))
+        tk.Label(jd_header, text="Job Description  (optional — paste for keyword matching)",
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left")
+        flat_btn(jd_header, "Clear", lambda: self.jd_box.delete("1.0", "end"),
+                 color=PANEL).pack(side="right")
+
+        self.jd_box = tk.Text(jd_panel, bg=INPUT, fg=TEXT, font=("Segoe UI", 10),
+                               height=5, relief="flat", padx=10, pady=8,
+                               insertbackground=TEXT, wrap="word",
+                               selectbackground=BLUE)
+        self.jd_box.pack(fill="x", padx=12, pady=(0, 10))
+        self.jd_box.insert("1.0", "Paste the job description here to see how well your CV keywords match...")
+        self.jd_box.bind("<FocusIn>", self._jd_focus_in)
+
+        # ── Tips panel ──
+        tips_panel = tk.Frame(tab, bg=CARD, highlightbackground=EDGE, highlightthickness=1)
+        tips_panel.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Label(tips_panel, text="Improvement Tips", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(10, 4))
+        self.tips_frame = tk.Frame(tips_panel, bg=CARD)
+        self.tips_frame.pack(fill="x", padx=12, pady=(0, 10))
+
+    def _jd_focus_in(self, _=None):
+        current = self.jd_box.get("1.0", "end").strip()
+        if current.startswith("Paste the job description"):
+            self.jd_box.delete("1.0", "end")
+
+    def _draw_ats_circle(self, pct, color):
+        c = self.ats_canvas
+        c.delete("all")
+        cx, cy, r = 65, 65, 55
+        # Background ring
+        c.create_oval(cx-r, cy-r, cx+r, cy+r, outline="#363d5a", width=10, fill=CARD)
+        # Score arc (0 pct = no arc, 100 pct = full circle)
+        if pct > 0:
+            extent = min(359.9, pct * 3.6)
+            c.create_arc(cx-r, cy-r, cx+r, cy+r,
+                         start=90, extent=-extent,
+                         outline=color, width=10, style="arc")
+        # Center text
+        c.create_text(cx, cy,     text=str(pct) + "%",
+                      fill=color, font=("Segoe UI", 22, "bold"))
+
+    def run_ats_check(self):
+        if not self.last_text:
+            messagebox.showwarning("ATS Check", "Run OCR on a document first!")
+            return
+        if not ATS_VAR:
+            messagebox.showerror("Error", "ats_checker.py not found!")
+            return
+
+        # Parse CV if not already done
+        parsed = self.last_parsed
+        if not parsed and CV_PARSER_VAR:
+            from cv_parser import cv_parse as _cv_parse
+            parsed = _cv_parse(self.last_text)
+            self.last_parsed = parsed
+
+        jd_text = self.jd_box.get("1.0", "end").strip()
+        if jd_text.startswith("Paste the job description"):
+            jd_text = ""
+
+        table_count = len(self.table_results)
+
+        report = ats_score(parsed, self.last_text,
+                           table_cells_count=table_count,
+                           job_description=jd_text)
+
+        pct   = report["percentage"]
+        color = report["rating_color"]
+
+        # Update circle
+        self._draw_ats_circle(pct, color)
+        self.ats_rating_var.set(report["rating"])
+        self.ats_max_var.set(str(report["total"]) + " / " + str(report["max_score"]) + " pts")
+
+        # Rebuild breakdown rows
+        for w in self.breakdown_frame.winfo_children():
+            w.destroy()
+
+        for item in report["breakdown"]:
+            row = tk.Frame(self.breakdown_frame, bg=CARD)
+            row.pack(fill="x", pady=2)
+
+            # Status dot
+            dot_color = GREEN if item["ok"] else "#cc4444"
+            tk.Label(row, text="●", bg=CARD, fg=dot_color,
+                     font=("Segoe UI", 10)).pack(side="left", padx=(0, 6))
+
+            # Label
+            tk.Label(row, text=item["label"], bg=CARD, fg=TEXT,
+                     font=("Segoe UI", 10), anchor="w").pack(side="left", fill="x", expand=True)
+
+            # Points
+            pts_color = GREEN if item["pts"] >= item["max"] else (
+                        "#f0a500" if item["pts"] > 0 else MUTED)
+            tk.Label(row, text=str(item["pts"]) + "/" + str(item["max"]),
+                     bg=CARD, fg=pts_color,
+                     font=("Segoe UI", 10, "bold"), width=6).pack(side="right")
+
+        # Rebuild tips
+        for w in self.tips_frame.winfo_children():
+            w.destroy()
+
+        if report["tips"]:
+            for i, tip in enumerate(report["tips"], 1):
+                tip_row = tk.Frame(self.tips_frame, bg=CARD)
+                tip_row.pack(fill="x", pady=1)
+                tk.Label(tip_row, text=str(i) + ".",
+                         bg=CARD, fg=MUTED, font=("Segoe UI", 9),
+                         width=3, anchor="e").pack(side="left")
+                tk.Label(tip_row, text=tip, bg=CARD, fg=TEXT,
+                         font=("Segoe UI", 9), anchor="w",
+                         wraplength=700, justify="left").pack(side="left", padx=(4, 0))
+        else:
+            tk.Label(self.tips_frame,
+                     text="No major issues found — great ATS compatibility!",
+                     bg=CARD, fg=GREEN, font=("Segoe UI", 10)).pack(anchor="w")
+
+        self.status_var.set("ATS Check complete — score: " + str(pct) + "%  (" + report["rating"] + ")")
+        self.notebook.select(4)  # switch to ATS tab
 
 # ─────────────────────────────────────────────────
 if __name__ == "__main__":

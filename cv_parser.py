@@ -77,7 +77,7 @@ SEHIRLER = [
     "istanbul", "ankara", "izmir", "bursa", "antalya", "adana",
     "gaziantep", "konya", "kayseri", "mersin", "eskisehir",
     "diyarbakir", "samsun", "denizli", "urfa", "malatya",
-    "london", "new york", "berlin", "paris", "amsterdam",
+    "london", "new york", "boston", "chicago", "seattle", "berlin", "paris", "amsterdam",
     "remote", "uzaktan", "hybrid", "hibrit",
 ]
 
