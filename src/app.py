@@ -20,7 +20,7 @@ from datetime import datetime
 def _open_file_dialog(title, filetypes, initialdir=None):
     """
     Show a file-open dialog that always starts in `initialdir`.
-    On Windows, uses PowerShell OpenFileDialog (ignores COM memory).
+    On Windows, uses PowerShell OpenFileDialog (avoids COM memory issues).
     Falls back to tkinter filedialog on other platforms.
     """
     if initialdir is None:
@@ -31,11 +31,10 @@ def _open_file_dialog(title, filetypes, initialdir=None):
         # Build PowerShell filter: "Images (*.png *.jpg)|*.png;*.jpg|All Files (*.*)|*.*"
         ps_filters = []
         for desc, patterns in filetypes:
-            # patterns like "*.png *.jpg *.jpeg" -> "*.png;*.jpg;*.jpeg"
             ps_pat = patterns.replace(" ", ";")
             ps_filters.append(f"{desc}|{ps_pat}")
         filter_str = "|".join(ps_filters)
-        safe_dir = initialdir.replace("\\", "\\\\").replace("'", "''")
+        safe_dir   = initialdir.replace("\\", "\\\\").replace("'", "''")
         safe_title = title.replace("'", "''")
         ps = f"""
 Add-Type -AssemblyName System.Windows.Forms
@@ -62,16 +61,16 @@ if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}
 
 try:
     from cv_parser import cv_parse
-    CV_PARSER_VAR = True
+    CV_PARSER_AVAILABLE = True
 except ImportError:
-    CV_PARSER_VAR = False
+    CV_PARSER_AVAILABLE = False
 
 try:
-    from aday_excel import aday_ekle_excel, excel_yenile, OPENPYXL_VAR, EXCEL_DOSYA
-    EXCEL_VAR = OPENPYXL_VAR
+    from candidate_excel import add_candidate_to_excel, refresh_excel, OPENPYXL_VAR, EXCEL_FILE
+    EXCEL_AVAILABLE = OPENPYXL_VAR
 except ImportError:
-    EXCEL_VAR = False
-    EXCEL_DOSYA = "candidate_pool.xlsx"
+    EXCEL_AVAILABLE = False
+    EXCEL_FILE = "candidate_pool.xlsx"
 
 try:
     from pdf2image import convert_from_path
@@ -81,9 +80,9 @@ except ImportError:
 
 try:
     from ats_checker import ats_score
-    ATS_VAR = True
+    ATS_AVAILABLE = True
 except ImportError:
-    ATS_VAR = False
+    ATS_AVAILABLE = False
 
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
@@ -105,7 +104,7 @@ WHITE = "#ffffff"
 # DATABASE
 # ─────────────────────────────────────────────────
 
-def init_db(path="documents.db"):
+def init_db(path="data/documents.db"):
     conn = sqlite3.connect(path)
     cur  = conn.cursor()
     cur.execute("""
@@ -139,7 +138,7 @@ def init_db(path="documents.db"):
 
 # ── Candidate CRUD ─────────────────────────────────
 
-def add_candidate(conn, c: dict) -> int:
+def add_candidate(conn, candidate: dict) -> int:
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO candidates
@@ -148,24 +147,24 @@ def add_candidate(conn, c: dict) -> int:
          source_file, notes, date)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
-        c.get("ad_soyad",""),   c.get("email",""),
-        c.get("telefon",""),    c.get("sehir",""),
-        c.get("linkedin",""),   c.get("github",""),
-        c.get("egitim_ozet",""), c.get("deneyim_yil", 0),
-        c.get("deneyim_ozet",""), c.get("beceri_str",""),
-        c.get("dil_str",""),    c.get("kaynak_dosya",""),
-        c.get("notlar",""),
+        candidate.get("full_name",          ""),  candidate.get("email",            ""),
+        candidate.get("phone",              ""),  candidate.get("city",             ""),
+        candidate.get("linkedin",           ""),  candidate.get("github",           ""),
+        candidate.get("education_summary",  ""),  candidate.get("experience_years", 0),
+        candidate.get("experience_summary", ""),  candidate.get("skills_str",       ""),
+        candidate.get("languages_str",      ""),  candidate.get("source_file",      ""),
+        candidate.get("notes",              ""),
         datetime.now().strftime("%Y-%m-%d %H:%M")
     ))
     conn.commit()
     return cur.lastrowid
 
-def update_candidate_field(conn, cid: int, field: str, value):
-    conn.cursor().execute(f"UPDATE candidates SET {field}=? WHERE id=?", (value, cid))
+def update_candidate_field(conn, candidate_id: int, field: str, value):
+    conn.cursor().execute(f"UPDATE candidates SET {field}=? WHERE id=?", (value, candidate_id))
     conn.commit()
 
-def delete_candidate(conn, cid: int):
-    conn.cursor().execute("DELETE FROM candidates WHERE id=?", (cid,))
+def delete_candidate(conn, candidate_id: int):
+    conn.cursor().execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
     conn.commit()
 
 def get_all_candidates(conn) -> list:
@@ -557,7 +556,7 @@ class App:
         # Stats row
         stats = tk.Frame(right, bg=BG)
         stats.pack(fill="x", pady=(0, 8))
-        self.v_words = tk.StringVar(value="—")
+        self.v_words  = tk.StringVar(value="—")
         self.v_blocks = tk.StringVar(value="—")
         self.v_chars  = tk.StringVar(value="—")
         for title, var in [("Words", self.v_words),
@@ -590,7 +589,7 @@ class App:
         sb.pack(side="right", fill="y")
         self.text_box.pack(fill="both", expand=True)
 
-        # Action buttons — always visible
+        # Action buttons
         action_row = tk.Frame(right, bg=BG)
         action_row.pack(fill="x")
         flat_btn(action_row, "Copy",         self.copy_text,     color=GREEN).pack(side="left", padx=(0, 6))
@@ -627,18 +626,18 @@ class App:
         right_f.pack(side="right", fill="both", expand=True)
         lbl(right_f, "Cell Contents").pack(anchor="w", padx=10, pady=(8, 4))
 
-        tree_ic = tk.Frame(right_f, bg=CARD)
-        tree_ic.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        tree_inner = tk.Frame(right_f, bg=CARD)
+        tree_inner.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         cols = ("no", "position", "text")
-        self.cell_tree = ttk.Treeview(tree_ic, columns=cols, show="headings")
+        self.cell_tree = ttk.Treeview(tree_inner, columns=cols, show="headings")
         self.cell_tree.heading("no",       text="#")
         self.cell_tree.heading("position", text="Position")
         self.cell_tree.heading("text",     text="Content")
         self.cell_tree.column("no",       width=35,  anchor="center")
         self.cell_tree.column("position", width=110, anchor="center")
         self.cell_tree.column("text",     width=260)
-        sb2 = tk.Scrollbar(tree_ic, command=self.cell_tree.yview,
+        sb2 = tk.Scrollbar(tree_inner, command=self.cell_tree.yview,
                             bg=PANEL, troughcolor=BG, relief="flat")
         self.cell_tree.configure(yscrollcommand=sb2.set)
         sb2.pack(side="right", fill="y")
@@ -664,12 +663,12 @@ class App:
 
         self._filter_vars = {}
         filters = [
-            ("Name",             "name"),
-            ("City",             "city"),
-            ("Skill",            "skill"),
-            ("Language",         "language"),
-            ("Education",        "education"),
-            ("Min. Exp. (years)","exp_min"),
+            ("Name",              "name"),
+            ("City",              "city"),
+            ("Skill",             "skill"),
+            ("Language",          "language"),
+            ("Education",         "education"),
+            ("Min. Exp. (years)", "exp_min"),
         ]
         for i, (label, key) in enumerate(filters):
             row = i // 3
@@ -729,9 +728,9 @@ class App:
 
         btn_f = tk.Frame(list_top, bg=CARD)
         btn_f.pack(side="right")
-        flat_btn(btn_f, "Show All",      self._list_candidates,   color=PANEL).pack(side="left", padx=(0, 4))
-        flat_btn(btn_f, "Export Excel",  self._export_excel,      color=PANEL).pack(side="left", padx=(0, 4))
-        flat_btn(btn_f, "Delete",        self._delete_candidate,  color="#8b1a1a").pack(side="left")
+        flat_btn(btn_f, "Show All",     self._list_candidates,  color=PANEL).pack(side="left", padx=(0, 4))
+        flat_btn(btn_f, "Export Excel", self._export_excel,     color=PANEL).pack(side="left", padx=(0, 4))
+        flat_btn(btn_f, "Delete",       self._delete_candidate, color="#8b1a1a").pack(side="left")
 
         # Treeview
         cols2 = ("id", "full_name", "city", "education",
@@ -739,14 +738,14 @@ class App:
         self.cand_tree = ttk.Treeview(list_f, columns=cols2,
                                        show="headings", selectmode="browse")
         headers = {
-            "id":        ("#",            45,  True),
-            "full_name": ("Name",        160,  False),
-            "city":      ("City",         90,  True),
-            "education": ("Education",   180,  False),
-            "exp_years": ("Exp. (yrs)",   90,  True),
-            "skills":    ("Skills",      200,  False),
-            "languages": ("Languages",   110,  False),
-            "score":     ("Match %",      70,  True),
+            "id":        ("#",          45,  True),
+            "full_name": ("Name",      160,  False),
+            "city":      ("City",       90,  True),
+            "education": ("Education", 180,  False),
+            "exp_years": ("Exp. (yrs)", 90,  True),
+            "skills":    ("Skills",    200,  False),
+            "languages": ("Languages", 110,  False),
+            "score":     ("Match %",    70,  True),
         }
         for col, (title, width, center) in headers.items():
             self.cand_tree.heading(col, text=title,
@@ -851,7 +850,7 @@ class App:
         self.doc_tree.pack(fill="both", expand=True)
         self.doc_tree.bind("<<TreeviewSelect>>", self._show_doc_text)
 
-        # Selected document text
+        # Selected document text preview
         sel_f = tk.Frame(tab, bg=CARD, highlightbackground=EDGE, highlightthickness=1)
         sel_f.pack(fill="x", padx=10, pady=(0, 10))
         lbl(sel_f, "Selected Document Text").pack(anchor="w", padx=10, pady=(8, 4))
@@ -987,7 +986,7 @@ class App:
         if self.processed_img is None:
             messagebox.showwarning("Warning", "Load an image first!"); return
 
-        # ── Multi-page PDF: OCR all pages and combine ──────────────────────
+        # Multi-page PDF: OCR all pages and combine
         if self.pdf_pages and len(self.pdf_pages) > 1:
             all_text   = []
             all_words  = []
@@ -1008,7 +1007,7 @@ class App:
 
             # Draw boxes on current page only (for preview)
             out = self.processed_img.copy()
-            cur_words  = [w for w in run_ocr(self.processed_img)[1]]
+            cur_words  = run_ocr(self.processed_img)[1]
             cur_blocks = find_text_blocks(self.processed_img)
         else:
             # Single image or single-page PDF
@@ -1125,11 +1124,11 @@ class App:
     def save_as_cv(self):
         if not self.last_text:
             messagebox.showwarning("Warning", "Run OCR first!"); return
-        if not CV_PARSER_VAR:
+        if not CV_PARSER_AVAILABLE:
             messagebox.showerror("Error", "cv_parser.py not found!"); return
         candidate = cv_parse(self.last_text)
         self.last_parsed = candidate          # store for ATS checker
-        candidate["kaynak_dosya"] = os.path.basename(self.active_path)
+        candidate["source_file"] = os.path.basename(self.active_path)
         self._open_cv_editor(candidate)
 
     def _open_cv_editor(self, candidate: dict):
@@ -1155,18 +1154,18 @@ class App:
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
         fields = [
-            ("Full Name",        "ad_soyad"),
-            ("Email",            "email"),
-            ("Phone",            "telefon"),
-            ("City",             "sehir"),
-            ("LinkedIn",         "linkedin"),
-            ("GitHub",           "github"),
-            ("Education",        "egitim_ozet"),
-            ("Experience (yrs)", "deneyim_yil"),
-            ("Experience Summary","deneyim_ozet"),
-            ("Skills",           "beceri_str"),
-            ("Languages",        "dil_str"),
-            ("Notes (GPA etc.)", "notlar"),
+            ("Full Name",         "full_name"),
+            ("Email",             "email"),
+            ("Phone",             "phone"),
+            ("City",              "city"),
+            ("LinkedIn",          "linkedin"),
+            ("GitHub",            "github"),
+            ("Education",         "education_summary"),
+            ("Experience (yrs)",  "experience_years"),
+            ("Experience Summary","experience_summary"),
+            ("Skills",            "skills_str"),
+            ("Languages",         "languages_str"),
+            ("Notes (GPA etc.)",  "notes"),
         ]
         entries = {}
         for label, key in fields:
@@ -1184,24 +1183,24 @@ class App:
             for key, var in entries.items():
                 candidate[key] = var.get()
             try:
-                candidate["deneyim_yil"] = float(candidate.get("deneyim_yil") or 0)
+                candidate["experience_years"] = float(candidate.get("experience_years") or 0)
             except ValueError:
-                candidate["deneyim_yil"] = 0.0
+                candidate["experience_years"] = 0.0
 
             cid = add_candidate(self.db, candidate)
             candidate["id"] = cid
 
-            if EXCEL_VAR:
+            if EXCEL_AVAILABLE:
                 try:
-                    candidate["eklenme_tarihi"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    aday_ekle_excel(candidate, EXCEL_DOSYA)
+                    candidate["date_added"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    add_candidate_to_excel(candidate, EXCEL_FILE)
                 except Exception:
                     pass
 
             win.destroy()
             self._list_candidates()
             self.notebook.select(2)
-            self.status_var.set(f"Candidate added: {candidate.get('ad_soyad','')}")
+            self.status_var.set(f"Candidate added: {candidate.get('full_name', '')}")
 
         btn_row = tk.Frame(win, bg=BG)
         btn_row.pack(fill="x", padx=14, pady=8)
@@ -1221,12 +1220,12 @@ class App:
                 tag = "mid"; score = ""
             self.cand_tree.insert("", "end", iid=str(c["id"]), tags=(tag,), values=(
                 c["id"],
-                c.get("full_name",""),
-                c.get("city",""),
-                c.get("education","")[:50],
-                c.get("exp_years",""),
-                c.get("skills","")[:60],
-                c.get("languages","")[:40],
+                c.get("full_name",  ""),
+                c.get("city",       ""),
+                c.get("education",  "")[:50],
+                c.get("exp_years",  ""),
+                c.get("skills",     "")[:60],
+                c.get("languages",  "")[:40],
                 score,
             ))
         self.cand_count_var.set(f"{len(candidates)} candidates")
@@ -1249,7 +1248,7 @@ class App:
             score = 0
             # Skills (max 60)
             if req_skills:
-                c_skills = c.get("skills","").lower()
+                c_skills = c.get("skills", "").lower()
                 matched  = sum(1 for s in req_skills if s in c_skills)
                 score   += int((matched / len(req_skills)) * 60)
             else:
@@ -1262,7 +1261,7 @@ class App:
                 score += 15
             # Language (max 15)
             if req_lang:
-                if req_lang in c.get("languages","").lower():
+                if req_lang in c.get("languages", "").lower():
                     score += 15
             else:
                 score += 8
@@ -1290,55 +1289,59 @@ class App:
         row = cur.fetchone()
         if not row: return
         c = dict(zip([d[0] for d in cur.description], row))
-        # Map DB columns to detail vars
-        mapping = {"email":"email","phone":"phone","linkedin":"linkedin","github":"github"}
+        mapping = {"email": "email", "phone": "phone", "linkedin": "linkedin", "github": "github"}
         for var_key, db_key in mapping.items():
-            self._detail_vars[var_key].set(c.get(db_key,"") or "")
-        self._notes_box.delete("1.0","end")
-        self._notes_box.insert("1.0", c.get("notes","") or "")
+            self._detail_vars[var_key].set(c.get(db_key, "") or "")
+        self._notes_box.delete("1.0", "end")
+        self._notes_box.insert("1.0", c.get("notes", "") or "")
 
     def _save_note(self):
         if self._selected_cid is None:
-            messagebox.showwarning("Warning","Select a candidate first!"); return
-        note = self._notes_box.get("1.0","end").strip()
+            messagebox.showwarning("Warning", "Select a candidate first!"); return
+        note = self._notes_box.get("1.0", "end").strip()
         update_candidate_field(self.db, self._selected_cid, "notes", note)
         self.status_var.set("Note saved.")
 
     def _delete_candidate(self):
         sel = self.cand_tree.selection()
         if not sel:
-            messagebox.showwarning("Warning","Select a candidate to delete!"); return
-        if messagebox.askyesno("Confirm","Delete this candidate?"):
+            messagebox.showwarning("Warning", "Select a candidate to delete!"); return
+        if messagebox.askyesno("Confirm", "Delete this candidate?"):
             delete_candidate(self.db, int(sel[0]))
             self._list_candidates()
 
     def _export_excel(self):
-        if not EXCEL_VAR:
-            messagebox.showerror("Missing Library","Excel export requires:\n\n  pip install openpyxl"); return
+        if not EXCEL_AVAILABLE:
+            messagebox.showerror("Missing Library", "Excel export requires:\n\n  pip install openpyxl"); return
         candidates = get_all_candidates(self.db)
         if not candidates:
-            messagebox.showwarning("Warning","No candidates in the pool yet!"); return
+            messagebox.showwarning("Warning", "No candidates in the pool yet!"); return
         path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx", filetypes=[("Excel","*.xlsx")],
-            initialfile=EXCEL_DOSYA)
+            defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")],
+            initialfile=EXCEL_FILE)
         if not path: return
-        # Map to Turkish field names expected by excel module
+        # Map DB columns to candidate_excel field names
         mapped = []
         for c in candidates:
             mapped.append({
-                "id": c["id"], "ad_soyad": c.get("full_name",""),
-                "email": c.get("email",""), "telefon": c.get("phone",""),
-                "sehir": c.get("city",""), "linkedin": c.get("linkedin",""),
-                "github": c.get("github",""), "egitim_ozet": c.get("education",""),
-                "deneyim_yil": c.get("exp_years",""),
-                "deneyim_ozet": c.get("exp_summary",""),
-                "beceri_str": c.get("skills",""), "dil_str": c.get("languages",""),
-                "kaynak_dosya": c.get("source_file",""),
-                "eklenme_tarihi": c.get("date",""),
-                "notlar": c.get("notes",""),
+                "id":                 c["id"],
+                "full_name":          c.get("full_name",    ""),
+                "email":              c.get("email",        ""),
+                "phone":              c.get("phone",        ""),
+                "city":               c.get("city",         ""),
+                "linkedin":           c.get("linkedin",     ""),
+                "github":             c.get("github",       ""),
+                "education_summary":  c.get("education",    ""),
+                "experience_years":   c.get("exp_years",    ""),
+                "experience_summary": c.get("exp_summary",  ""),
+                "skills_str":         c.get("skills",       ""),
+                "languages_str":      c.get("languages",    ""),
+                "source_file":        c.get("source_file",  ""),
+                "date_added":         c.get("date",         ""),
+                "notes":              c.get("notes",        ""),
             })
         try:
-            excel_yenile(mapped, path)
+            refresh_excel(mapped, path)
             messagebox.showinfo("Success", f"Excel saved:\n{path}")
             self.status_var.set(f"Excel saved: {os.path.basename(path)}")
         except Exception as e:
@@ -1348,10 +1351,10 @@ class App:
 
     def save_document_btn(self):
         if not self.last_text and not self.last_words:
-            messagebox.showwarning("Warning","Run OCR first!"); return
+            messagebox.showwarning("Warning", "Run OCR first!"); return
         save_document(self.db, os.path.basename(self.active_path),
                       self.last_text, len(self.last_words), len(self.last_blocks))
-        messagebox.showinfo("Success","Document saved to database!")
+        messagebox.showinfo("Success", "Document saved to database!")
         self.show_all_docs()
         self.notebook.select(3)
 
@@ -1366,7 +1369,7 @@ class App:
         for row in self.doc_tree.get_children():
             self.doc_tree.delete(row)
         for row in data:
-            self.doc_tree.insert("","end",values=row)
+            self.doc_tree.insert("", "end", values=row)
 
     def _show_doc_text(self, _=None):
         sel = self.doc_tree.selection()
@@ -1376,18 +1379,17 @@ class App:
         cur.execute("SELECT text FROM documents WHERE id=?", (doc_id,))
         row = cur.fetchone()
         if row:
-            self.selected_text.delete("1.0","end")
+            self.selected_text.delete("1.0", "end")
             self.selected_text.insert("1.0", row[0])
 
     def delete_doc(self):
         sel = self.doc_tree.selection()
         if not sel:
-            messagebox.showwarning("Warning","Select a document to delete!"); return
+            messagebox.showwarning("Warning", "Select a document to delete!"); return
         doc_id = self.doc_tree.item(sel[0])["values"][0]
-        if messagebox.askyesno("Confirm","Delete this document?"):
+        if messagebox.askyesno("Confirm", "Delete this document?"):
             delete_document(self.db, doc_id)
             self.show_all_docs()
-
 
     # ── TAB: ATS SCORE ────────────────────────────
 
@@ -1476,27 +1478,27 @@ class App:
         cx, cy, r = 65, 65, 55
         # Background ring
         c.create_oval(cx-r, cy-r, cx+r, cy+r, outline="#363d5a", width=10, fill=CARD)
-        # Score arc (0 pct = no arc, 100 pct = full circle)
+        # Score arc
         if pct > 0:
             extent = min(359.9, pct * 3.6)
             c.create_arc(cx-r, cy-r, cx+r, cy+r,
                          start=90, extent=-extent,
                          outline=color, width=10, style="arc")
         # Center text
-        c.create_text(cx, cy,     text=str(pct) + "%",
+        c.create_text(cx, cy, text=str(pct) + "%",
                       fill=color, font=("Segoe UI", 22, "bold"))
 
     def run_ats_check(self):
         if not self.last_text:
             messagebox.showwarning("ATS Check", "Run OCR on a document first!")
             return
-        if not ATS_VAR:
+        if not ATS_AVAILABLE:
             messagebox.showerror("Error", "ats_checker.py not found!")
             return
 
         # Parse CV if not already done
         parsed = self.last_parsed
-        if not parsed and CV_PARSER_VAR:
+        if not parsed and CV_PARSER_AVAILABLE:
             from cv_parser import cv_parse as _cv_parse
             parsed = _cv_parse(self.last_text)
             self.last_parsed = parsed
@@ -1527,16 +1529,13 @@ class App:
             row = tk.Frame(self.breakdown_frame, bg=CARD)
             row.pack(fill="x", pady=2)
 
-            # Status dot
             dot_color = GREEN if item["ok"] else "#cc4444"
             tk.Label(row, text="●", bg=CARD, fg=dot_color,
                      font=("Segoe UI", 10)).pack(side="left", padx=(0, 6))
 
-            # Label
             tk.Label(row, text=item["label"], bg=CARD, fg=TEXT,
                      font=("Segoe UI", 10), anchor="w").pack(side="left", fill="x", expand=True)
 
-            # Points
             pts_color = GREEN if item["pts"] >= item["max"] else (
                         "#f0a500" if item["pts"] > 0 else MUTED)
             tk.Label(row, text=str(item["pts"]) + "/" + str(item["max"]),
@@ -1563,7 +1562,7 @@ class App:
                      bg=CARD, fg=GREEN, font=("Segoe UI", 10)).pack(anchor="w")
 
         self.status_var.set("ATS Check complete — score: " + str(pct) + "%  (" + report["rating"] + ")")
-        self.notebook.select(4)  # switch to ATS tab
+        self.notebook.select(4)
 
 # ─────────────────────────────────────────────────
 if __name__ == "__main__":

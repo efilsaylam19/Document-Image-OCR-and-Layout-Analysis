@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Databases (generated at runtime)
+*.db
+
+# Excel output (generated at runtime)
+*.xlsx
+
+# Analysis output images
+analysis_result.png
+analiz_sonucu.png
+
+# Environment
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace

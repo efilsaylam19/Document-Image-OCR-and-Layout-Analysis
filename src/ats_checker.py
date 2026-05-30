@@ -41,9 +41,9 @@ def check_contact(parsed):
     """Contact completeness. Max 20 pts."""
     items = [
         ("Email",    bool(parsed.get("email")),    5),
-        ("Phone",    bool(parsed.get("telefon")),  5),
+        ("Phone",    bool(parsed.get("phone")),    5),
         ("LinkedIn", bool(parsed.get("linkedin")), 5),
-        ("Location", bool(parsed.get("sehir")),    5),
+        ("Location", bool(parsed.get("city")),     5),
     ]
     score = sum(pts for _, ok, pts in items if ok)
     details = []
@@ -71,7 +71,7 @@ def check_sections(text):
 
 def check_skills(parsed):
     """Skills count. Max 15 pts."""
-    skills = parsed.get("beceriler", [])
+    skills = parsed.get("skills", [])
     n = len(skills)
     if n >= 9:
         pts = 15
@@ -131,8 +131,8 @@ def check_action_verbs(text):
 
 def check_dates(parsed):
     """Date consistency in experience. Max 10 pts."""
-    experiences = parsed.get("deneyim_detay", [])
-    with_dates = [e for e in experiences if e.get("sure")]
+    experiences = parsed.get("experience_detail", [])
+    with_dates = [e for e in experiences if e.get("duration")]
     if not experiences:
         pts = 5
         ok = False
